@@ -114,6 +114,7 @@ async def find_team(message: Message):
 async def run_leobot(message: Message, state: FSMContext):
     user = get_user(message.chat.id)
     if message.text.lower() == "стоп":
+        user.viewed_index = 0
         user.is_finding = ""
         session.commit()
         await state.finish()
@@ -136,25 +137,28 @@ async def run_leobot(message: Message, state: FSMContext):
                 user.viewed_index = i
                 session.commit()
                 return await message.answer(f"__* Имя*__: {markdown.escape_md(curr_user.firstname)}\n"
-                                     f"__*Фамилия*__: {markdown.escape_md(curr_user.lastname)}\n"
-                                     f"__*Дата рождения*__: {markdown.escape_md(curr_user.dob)}\n"
-                                     f"__*Компетенции*__: {markdown.escape_md(curr_user.comp)}", reply_markup=markup,
-                                     parse_mode="MarkdownV2")
+                                            f"__*Фамилия*__: {markdown.escape_md(curr_user.lastname)}\n"
+                                            f"__*Дата рождения*__: {markdown.escape_md(curr_user.dob)}\n"
+                                            f"__*Компетенции*__: {markdown.escape_md(curr_user.comp)}",
+                                            reply_markup=markup,
+                                            parse_mode="MarkdownV2")
         else:
             await message.answer("Пользователи закончились(")
 
 
 @dp.message_handler(state=Find.start)
 async def find(message: Message, state: FSMContext):
+    user = get_user(message.chat.id)
     if message.text.lower() == "назад":
+        user.is_finding = ""
+        session.commit()
         await state.finish()
         return await message.answer("вы возвращены в главное меню.", reply_markup=default_markup)
-    user = get_user(message.chat.id)
     users = session.query(User).all()
     if message.text in comps:
         user.is_finding = message.text
         session.commit()
-        for i in range(user.viewed_index + 1, len(users)):
+        for i in range(user.viewed_index, len(users)):
             curr_user = users[i]
             if user.id == curr_user.id:
                 continue
@@ -206,7 +210,10 @@ async def show_new(message: Message):
     buttons = [KeyboardButton("Показать ещё"), KeyboardButton("Назад")]
     add_buttons(markup, buttons)
     user = get_user(message.chat.id)
-    event = get_new_by_tags(user.comp.split(","), user)
+    if user.comp is not None:
+        event = get_new_by_tags(user.comp.split(","), user)
+    else:
+        event = get_new_by_tags([], user)
     photos = os.listdir("imgs")
     photos = [i.split(".")[0] for i in photos]
     if isinstance(event, str):
@@ -307,7 +314,8 @@ async def start(message: Message):
         user = User(firstname=message.from_user.first_name,
                     lastname=message.from_user.last_name,
                     chat_id=message.chat.id,
-                    link=message.from_user.url)
+                    link=message.from_user.url,
+                    comp="")
         session.add(user)
         session.commit()
     else:
@@ -344,6 +352,41 @@ async def schedule_func(message: Message):
         else:
             return await message.answer("К сожалению, вашей группы нет в списке(\n"
                                         "Проверьте корректность введённого номера группы в профиле")
+    else:
+        return await message.answer("Поле 'группа' не заполнено. Вы можете заполнить его во вкладке 'Профиль' в главном меню.")
+
+
+class Tag(StatesGroup):
+    set = State()
+
+
+@dp.message_handler(LevelFilter(2), state=Tag.set)
+async def set_tags(message: Message, state: FSMContext):
+    if message.text.lower() == "готово":
+        await state.finish()
+        return await message.answer("Тэги сохранены.", reply_markup=default_markup)
+    if message.text in comps:
+        user = get_user(message.chat.id)
+        event = session.query(Event).filter_by(id=user.last_published).first()
+        if not message.text in event.tags:
+            event.tags += message.text + ", "
+            session.commit()
+            return await message.answer("Тэг добавлен.")
+        else:
+            return await message.answer("Тэг уже был присвоен.")
+    return await message.answer("Я не знаю такой компетенции(\nВыберите из предложенных ниже")
+
+
+@dp.message_handler(LevelFilter(2), commands=["tags"])
+async def add_tags(message: Message):
+    user = get_user(message.chat.id)
+    event = session.query(Event).filter_by(id=user.last_published).first()
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    buttons = [KeyboardButton(i) for i in comps] + [KeyboardButton("Готово")]
+    add_buttons(markup, buttons)
+    if event is not None:
+        await Tag.set.set()
+        return await message.answer("Выберите компетенции, для которых подойдёт эта новость:", reply_markup=markup)
 
 
 @dp.message_handler(LevelFilter(2), commands=["add_event"])
@@ -357,6 +400,7 @@ async def add_events(message: Message):
 
 @dp.message_handler(content_types=["photo"], state=EventState.add)
 async def add_new(message: Message, state: FSMContext):
+    user = get_user(message.chat.id)
     uid = uuid.uuid4().hex
     try:
         event = Event(id=uid, text=message.caption, tags="")
@@ -364,13 +408,17 @@ async def add_new(message: Message, state: FSMContext):
         session.commit()
         await message.photo[-1].download(destination_file=f"imgs/{uid}.jpg")
         await state.finish()
-        return await message.answer("Сохранено.", reply_markup=default_markup)
+        user.last_published = uid
+        session.commit()
+        return await message.answer("Сохранено. Чтобы добавить тэги(компетенции) к новости, пропишите /tags.",
+                                    reply_markup=default_markup)
     except:
         return await message.answer("Не получилось сохранить новость.")
 
 
 @dp.message_handler(state=EventState.add)
 async def add_text_new(message: Message, state: FSMContext):
+    user = get_user(message.chat.id)
     if message.text.lower() == "отмена":
         await state.finish()
         return await message.answer("Отменено.", reply_markup=default_markup)
@@ -380,7 +428,10 @@ async def add_text_new(message: Message, state: FSMContext):
         session.add(event)
         session.commit()
         await state.finish()
-        return await message.answer("Сохранено.", reply_markup=default_markup)
+        user.last_published = uid
+        session.commit()
+        return await message.answer("Сохранено. Чтобы добавить тэги(компетенции) к новости, пропишите /tags.",
+                                    reply_markup=default_markup)
     except:
         await state.finish()
         return await message.answer("Новость не сохранена.")
